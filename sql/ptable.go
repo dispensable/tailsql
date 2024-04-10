@@ -46,7 +46,7 @@ func NewTableParser(name string, rowRe string, logger *logrus.Logger) (*TablePar
 	coludts := []*ColUdt{}
 	cols := []string{"_id"}
 	for i, cname := range re.SubexpNames() {
-		if i == 0 || name == "" {
+		if i == 0 || cname == "" {
 			continue
 		}
 		metadata := strings.Split(cname, "_")
@@ -56,7 +56,7 @@ func NewTableParser(name string, rowRe string, logger *logrus.Logger) (*TablePar
 		cols = append(cols, fname)
 	}
 
-	logger.Infof("cols: %+v", cols)
+	logger.Debugf("cols: %+v", cols)
 	
 	return &TableParser{
 		Name: name,

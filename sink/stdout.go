@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	tailSql "github.com/dispensable/tailsql/sql"
 	"github.com/sirupsen/logrus"
 )
 
@@ -15,7 +14,7 @@ type SqlSink interface {
 
 type StdOutSink struct {}
 
-func (s *StdOutSink) HandelRows(sqlText string, rows *sql.Rows, parser *tailSql.TableParser, logger *logrus.Logger) error {
+func (s *StdOutSink) HandelRows(sqlText string, rows *sql.Rows, logger *logrus.Logger) error {
 	if rows == nil {
 		logger.Warnf("No valide rows parsed in this round, continue ...")
 		return nil
@@ -43,4 +42,52 @@ func (s *StdOutSink) HandelRows(sqlText string, rows *sql.Rows, parser *tailSql.
 	}
 	fmt.Println("")
 	return nil
+}
+
+type StdOutSqlRowsSink struct {
+	in chan any
+	sql string
+	logger *logrus.Logger
+	formatter RowsFormatter
+}
+
+func NewStdOutSqlRowsSink(sqlText string, formatter RowsFormatter,
+	logger *logrus.Logger) *StdOutSqlRowsSink {
+	sink := &StdOutSqlRowsSink{
+		in: make(chan any),
+		sql: sqlText,
+		logger: logger,
+		formatter: formatter,
+	}
+	sink.init()
+
+	return sink
+}
+
+func (s *StdOutSqlRowsSink) init() {
+	go func() {
+		for v := range s.in {
+			if v == nil {
+				s.logger.Warnf("get nil from upstream")
+				continue
+			}
+			s.logger.Infof(">> query result <<\n")
+			s.logger.Debugf("got msg: %v", v)
+			rows, ok := v.(*sql.Rows)
+			if !ok {
+				s.logger.Errorf("wrong result returned: %v\n", rows)
+				continue
+			}
+			defer rows.Close()
+			err := s.formatter.Print(s.sql, rows)
+			if err != nil {
+				s.logger.Errorf("print rows failed: %s", err)
+			}
+		}
+	}()
+	s.logger.Debugf("inited")
+}
+
+func (s *StdOutSqlRowsSink) In() chan<- any {
+	return s.in
 }
