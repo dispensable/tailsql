@@ -21,11 +21,8 @@ import (
 	"github.com/reugn/go-streams/flow"
 
 	"github.com/araddon/qlbridge/datasource"
-	"github.com/araddon/qlbridge/datasource/membtree"
 	"github.com/araddon/qlbridge/expr"
 	"github.com/araddon/qlbridge/expr/builtins"
-	"github.com/araddon/qlbridge/lex"
-	"github.com/araddon/qlbridge/schema"
 	"github.com/araddon/qlbridge/vm"
 
 	tailsink "github.com/dispensable/tailsql/sink"
@@ -44,6 +41,12 @@ type WindowOpt struct {
 	Size time.Duration
 	SlidingInterval time.Duration
 	TsExtractor func(LRow) int64
+}
+
+type ThrottlerOpt struct {
+	MaxEles int
+	Period time.Duration
+	BuffSize int
 }
 
 type LTable struct {
@@ -110,6 +113,7 @@ func (s *StreamQueryer) getLineMapFunc(re string, tname string) (flow.MapFunctio
 }
 
 func (s *StreamQueryer) getFilterFunc(filter string, cols []string) (flow.FilterPredicate[LRow], error) {
+	expr.FuncAdd("randfilter", &RandFilter{})
 	if s.filterExprs == nil {
 		s.filterExprs = make(map[string]expr.Node)
 	}
@@ -127,13 +131,17 @@ func (s *StreamQueryer) getFilterFunc(filter string, cols []string) (flow.Filter
 		ast := s.filterExprs[filter]
 		s.logger.Debugf("expr: %v", ast)
 		val, _ := vm.Eval(evalCtx, ast)
+		if val == nil {
+			s.logger.Warnf("filter %s on %v got nil, ignore this row", filter, l)
+			return false
+		}
 		v := val.Value()
 		value, ok := v.(bool)
-		s.logger.Debugf("filter %s on %v: %t", filter, l, value)
 		if !ok {
 			s.logger.Errorf("filter %s not return bool value", filter)
 			return false
 		}
+		s.logger.Debugf("filter %s on %v: %t", filter, l, value)
 		return value
 	}
 
@@ -152,36 +160,37 @@ func (s *StreamQueryer) getWinByOpt(opt *WindowOpt) streams.Flow {
 	}
 }
 
-func (s *StreamQueryer) getLRowsToTableFunc(name string,
-	cols []string) flow.MapFunction[[]LRow, *membtree.StaticDataSource] {
-	colsTotal := len(cols)
-	idxRow := colsTotal - 1
-
-	f := func(rows []LRow) *membtree.StaticDataSource {
-		// update records idx in the window
-		for idx, r := range rows {
-			r[idxRow] = idx
-		}
-		sd := membtree.NewStaticDataSource(name, idxRow, rows, cols)
-		return sd
-	}
-	return f
-}
-
-// tableMata: key is table name []string value contains cols name
-func (s *StreamQueryer) getLRowsToTableByTnameFunc(
-	tableMeta map[string][]string) (flow.MapFunction[[]LRow, SQLEngine], error) {
-	tableColMeta := make(map[string][]int, len(tableMeta))
-	for name, cols := range tableMeta {
-		tableColMeta[name] = []int{len(cols)-1, len(cols)-2}
-	}
-
+func (s *StreamQueryer) getDBEngine(engine string) (SQLEngine, error) {
 	lineParsersMap := make(map[string]*LineParser, len(s.lineParsers))
 	for _, l := range s.lineParsers {
 		lineParsersMap[l.Tname] = l
 	}
 
-	sqlE, err := NewSQLiteEngine(lineParsersMap, s.logger)
+	switch engine {
+	case "sqlite":
+		return NewSQLiteEngine(lineParsersMap, s.logger)
+	case "duckdb":
+		return NewDuckDBEngine(lineParsersMap, s.logger)
+	case "qlbridge":
+		if len(s.lineParsers) != 1 {
+			return nil, fmt.Errorf("qlbridge memtree db does not support multiple table")
+		}
+		lp := s.lineParsers[0]
+		return NewQLMembtreeDSEngine(lp.Tname, lp.Cols, s.logger)
+	default:
+		return nil, fmt.Errorf("%s engine unsupported", engine)
+	}
+}
+
+// tableMata: key is table name []string value contains cols name
+func (s *StreamQueryer) getLRowsToTableByTnameFunc(
+	tableMeta map[string][]string, dbEngine string) (flow.MapFunction[[]LRow, SQLEngine], error) {
+	tableColMeta := make(map[string][]int, len(tableMeta))
+	for name, cols := range tableMeta {
+		tableColMeta[name] = []int{len(cols)-1, len(cols)-2}
+	}
+
+	sqlE, err := s.getDBEngine(dbEngine)
 	if err != nil {
 		s.logger.Errorf("create sqlite engine failed: %s", err)
 		return nil, err
@@ -228,74 +237,6 @@ func (s *StreamQueryer) getLRowsToTableByTnameFunc(
 	return f, nil
 }
 
-func (s *StreamQueryer) getRunSqlMapF(tname, sqlText string) flow.MapFunction[*membtree.StaticDataSource, *sql.Rows] {
-	f := func(ds *membtree.StaticDataSource) *sql.Rows {
-		err := schema.DefaultRegistry().SchemaDrop(tname, tname, lex.TokenSchema)
-		if err != nil {
-			s.logger.Warnf("drop schema for %s err: %s", tname, err)
-		}
-		err = schema.RegisterSourceAsSchema(tname, ds)
-		if err != nil {
-			s.logger.Errorf("registe schema err: %s", err)
-			return nil
-		}
-		db, err := sql.Open("qlbridge", tname)
-		if err != nil {
-			s.logger.Errorf("open %s db failed: %s", tname, err)
-			return nil
-		}
-		defer db.Close()
-
-		rows, err := db.Query(sqlText)
-		if err != nil {
-			s.logger.Errorf("run sql %s failed on %s err: %s", sqlText, tname, err)
-			return nil
-		}
-
-		return rows
-	}
-	return f
-}
-
-func (s *StreamQueryer) QueryOnStaticDS(sqlText string, dsn string,
-	dss map[string]*membtree.StaticDataSource) *sql.Rows {
-
-	builtins.LoadAllBuiltins()
-	// registe ds to our db
-	for tname, ds := range dss {
-		s.logger.Debugf(">> add records %s -> %v", tname, ds)
-		err := schema.DefaultRegistry().SchemaDrop(tname, tname, lex.TokenSchema)
-		if err != nil {
-			s.logger.Warnf("drop schema for %s err: %s", tname, err)
-		}
-		err = schema.RegisterSourceAsSchema(tname, ds)
-		if err != nil {
-			s.logger.Errorf("registe schema err: %s", err)
-			return nil
-		}
-	}
-	// now we can run sql on it
-	db, err := sql.Open("qlbridge", dsn)
-	if err != nil {
-		s.logger.Errorf("open %s db failed: %s", dsn, err)
-		return nil
-	}
-	defer db.Close()
-	
-	rows, err := db.Query(sqlText)
-	if err != nil {
-		s.logger.Errorf("run sql %s failed on %s err: %s", sqlText, dsn, err)
-		return nil
-	}
-	rcols, err := rows.Columns()
-	if err != nil {
-		s.logger.Errorf("parse rows result cols failed: %s", err)
-	}
-	s.logger.Debugf("query `%s` finished, rows cols: %v", sqlText, rcols)
-	// s.PrintRows(rows, false)
-	return rows
-}
-
 func (s *StreamQueryer) getRunSqlOnMultiTableMapF(
 	sqlText string) flow.MapFunction[SQLEngine, *sql.Rows] {
 	f := func(se SQLEngine) *sql.Rows {
@@ -332,63 +273,6 @@ func (s *StreamQueryer) getFormatter(format string) (tailsink.RowsFormatter, err
 	}
 }
 
-func (s *StreamQueryer) ParalleRun(rowRes []string, filters []string,
-	winOpts []*WindowOpt, sqlTexts []string,
-	sinkTo string, formatter string) error {
-
-	// prepare parse functions
-	lparseFuncs := []flow.MapFunction[string, LRow]{}
-	for ridx, re := range rowRes {
-		s.tableNames = append(s.tableNames, fmt.Sprintf("t%d", ridx))
-		pf, err := s.getLineMapFunc(re, s.tableNames[ridx])
-		if err != nil {
-			return err
-		}
-		lparseFuncs = append(lparseFuncs, pf)
-	}
-
-	// prepare filter functions
-	builtins.LoadAllBuiltins()
-	filterFuncs := []flow.FilterPredicate[LRow]{}
-	for fidx, filter := range filters {
-		rf, err := s.getFilterFunc(filter, s.lineParsers[fidx].Cols)
-		if err != nil {
-			return fmt.Errorf("init filter func error: %s", err)
-		}
-		filterFuncs = append(filterFuncs, rf)
-	}
-
-	cfunc, sources, err := s.GenerateFilesSource()
-	if err != nil {
-		s.logger.Errorf("create fs source failed: %s", err)
-		return err
-	}
-	defer cfunc()
-
-	go s.waitForQuit()
-
-	pprinter, err := s.getFormatter(formatter)
-	if err != nil {
-		return err
-	}
-	// log -> parse -> sql row -> window -> ds -> run sql -> sink
-	for sidx, src := range sources {
-		src.Via(
-			flow.NewMap[string, LRow](lparseFuncs[sidx], 10),
-		).Via(flow.NewFilter[LRow](filterFuncs[sidx], 10),
-		).Via(s.getWinByOpt(winOpts[sidx]),
-		).Via(flow.NewMap[[]LRow, *membtree.StaticDataSource](
-			s.getLRowsToTableFunc(
-				s.tableNames[sidx], s.lineParsers[sidx].Cols,
-			), 1),
-		).Via(flow.NewMap[*membtree.StaticDataSource, *sql.Rows](
-			s.getRunSqlMapF(s.tableNames[sidx], sqlTexts[sidx]),
-			1),
-		).To(tailsink.NewStdOutSqlRowsSink(sqlTexts[sidx], pprinter, s.logger))
-	}	
-	return nil
-}
-
 func (s *StreamQueryer) PrintRows(rows *sql.Rows, closeAfterPrint bool) error {
 	if rows == nil {
 		s.logger.Warnf("No valide rows parsed in this round, continue ...")
@@ -422,8 +306,46 @@ func (s *StreamQueryer) PrintRows(rows *sql.Rows, closeAfterPrint bool) error {
 	return nil
 }
 
+func (s *StreamQueryer) getFilterFuncs(filters []string) ([]flow.FilterPredicate[LRow], error) {
+	// prepare filter functions
+	builtins.LoadAllBuiltins()
+	filterFuncs := make([]flow.FilterPredicate[LRow], len(filters))
+	for fidx, filter := range filters {
+		if filter == "" {
+			// use don't wanna use filter on this stream ignore
+			filterFuncs[fidx] = nil
+			continue
+		}
+
+		rf, err := s.getFilterFunc(filter, s.lineParsers[fidx].Cols)
+		if err != nil {
+			return nil, fmt.Errorf("init filter func error: %s", err)
+		}
+		filterFuncs[fidx] = rf
+	}
+	return filterFuncs, nil
+}
+
+func (s *StreamQueryer) getThrottlers(tconfigs []*ThrottlerOpt) ([]*flow.Throttler, error) {
+	if len(tconfigs) == 0 {
+		return nil, nil
+	}
+
+	r := make([]*flow.Throttler, len(tconfigs))
+	for idx, tc := range tconfigs {
+		// maxeles zero means we don't wanna a throttler
+		if tc == nil || tc.MaxEles == 0 {
+			r[idx] = nil
+			continue
+		}
+		r[idx] = flow.NewThrottler(tc.MaxEles, tc.Period, tc.BuffSize, flow.Discard)
+	}
+	return r, nil
+}
+
 func (s *StreamQueryer) JoinRun(rowRes, filters []string,
-	winOpt *WindowOpt, sqlText, sinkTo string, formatter string) error {
+	winOpt *WindowOpt, sqlText, sinkTo, formatter, dbengine string,
+	throttleOpts []*ThrottlerOpt) error {
 	// prepare parse functions
 	lparseFuncs := []flow.MapFunction[string, LRow]{}
 	for ridx, re := range rowRes {
@@ -436,30 +358,44 @@ func (s *StreamQueryer) JoinRun(rowRes, filters []string,
 	}
 
 	// prepare filter functions
-	builtins.LoadAllBuiltins()
-	filterFuncs := []flow.FilterPredicate[LRow]{}
-	for fidx, filter := range filters {
-		rf, err := s.getFilterFunc(filter, s.lineParsers[fidx].Cols)
-		if err != nil {
-			return fmt.Errorf("init filter func error: %s", err)
-		}
-		filterFuncs = append(filterFuncs, rf)
+	filterFuncs, err := s.getFilterFuncs(filters)
+	if err != nil {
+		return err
 	}
 
+	// prepare throttler
+	throttlers, err := s.getThrottlers(throttleOpts)
+	if err != nil {
+		return err
+	}
+
+	// prepare fs source
 	cancelTailF, sources, err := s.GenerateFilesSource()
 	if err != nil {
 		return err
 	}
 	defer cancelTailF()
 
-	// log -> parse -> sql row -> window -> ds -> run sql -> sink
-	// log -> parse -> sql row /
+	// log -> parse -> filter -> throttler -> sql row -> window -> ds -> run sql -> sink
+	// log -> parse -> filter -> throttler -> sql row /
 	// ...
 	var mFlows []streams.Flow
 	for sidx, src := range sources {
 		f := src.Via(
-			flow.NewMap[string, LRow](lparseFuncs[sidx], 1),
-		).Via(flow.NewFilter[LRow](filterFuncs[sidx], 1))
+			flow.NewMap[string, LRow](lparseFuncs[sidx], 10),
+		)
+
+		// if user not defined filter we just ignore
+		if len(filterFuncs) > 0 && filterFuncs[sidx] != nil {
+			f.Via(flow.NewFilter[LRow](filterFuncs[sidx], 10))	
+		}
+
+
+		// if user not defined throttler we just ignore
+		if len(throttlers) > 0 && throttlers[sidx] != nil {
+			f.Via(throttlers[sidx])
+		}
+
 		mFlows = append(mFlows, f)
 	}
 	mFlow := flow.Merge(mFlows...)
@@ -471,7 +407,7 @@ func (s *StreamQueryer) JoinRun(rowRes, filters []string,
 
 	go s.waitForQuit()
 
-	insertRowsToSqlNg, err := s.getLRowsToTableByTnameFunc(tableMetaData)
+	insertRowsToSqlNg, err := s.getLRowsToTableByTnameFunc(tableMetaData, dbengine)
 	if err != nil {
 		return err
 	}

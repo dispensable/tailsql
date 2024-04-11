@@ -13,48 +13,75 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func parseWinOpt(optstrs []string) ([]*sql.WindowOpt, error) {
-	r := make([]*sql.WindowOpt, len(optstrs))
-	for idx, s := range optstrs {
-		splited := strings.Split(s, ":")
-		if len(splited) != 3 {
-			return nil, fmt.Errorf("failed to parse %s to winopt, need 3 fields", s)
-		}
+func parseWinOpt(s string) (*sql.WindowOpt, error) {
+	splited := strings.Split(s, ":")
+	if len(splited) != 3 {
+		return nil, fmt.Errorf("failed to parse %s to winopt, need 3 fields", s)
+	}
 
-		size, err := strconv.ParseUint(splited[0], 10, 32)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse windows size duration: %s", splited[0])
-		}
+	size, err := strconv.ParseUint(splited[0], 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse windows size duration: %s", splited[0])
+	}
 
-		slideInterval, err := strconv.ParseInt(splited[1], 10, 32)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse slide interval as seconds: %s", splited[1])
-		}
+	slideInterval, err := strconv.ParseInt(splited[1], 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse slide interval as seconds: %s", splited[1])
+	}
 
-		idxOfTs, err := strconv.ParseInt(splited[2], 10, 32)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse idx of ts: %s", splited[2])
-		}
+	idxOfTs, err := strconv.ParseInt(splited[2], 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse idx of ts: %s", splited[2])
+	}
 
-		var tsExtracF func(sql.LRow) int64
-		if idxOfTs >= 0 {
-			tsExtracF = func(row sql.LRow) int64 {
-				f := row[idxOfTs]
-				if v, ok := f.(time.Time); ok {
-					return int64(v.Nanosecond())
-				} else {
-					panic(fmt.Sprintf("idx %d of row is not a date type", idxOfTs))
-				}
+	var tsExtracF func(sql.LRow) int64
+	if idxOfTs >= 0 {
+		tsExtracF = func(row sql.LRow) int64 {
+			f := row[idxOfTs]
+			if v, ok := f.(time.Time); ok {
+				return int64(v.Nanosecond())
+			} else {
+				panic(fmt.Sprintf("idx %d of row is not a date type", idxOfTs))
 			}
 		}
-
-		r[idx] = &sql.WindowOpt{
-			Size: time.Duration(size * uint64(time.Second)),
-			SlidingInterval: time.Duration(slideInterval * int64(time.Second)),
-			TsExtractor: tsExtracF,
-		}
 	}
-	return r, nil
+
+	return &sql.WindowOpt{
+		Size: time.Duration(size * uint64(time.Second)),
+		SlidingInterval: time.Duration(slideInterval * int64(time.Second)),
+		TsExtractor: tsExtracF,
+	}, nil
+}
+
+func parseThrottleOpt(s string) (*sql.ThrottlerOpt, error) {
+	if s == "" {
+		return nil, nil
+	}
+	splited := strings.Split(s, ":")
+	if len(splited) != 3 {
+		return nil, fmt.Errorf("failed to parse %s to throttler, need 3 fields", s)
+	}
+
+	maxEles, err := strconv.ParseUint(splited[0], 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse max eles: %s", splited[0])
+	}
+
+	interval, err := strconv.ParseInt(splited[1], 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse throttle interval as seconds: %s", splited[1])
+	}
+
+	buffSize, err := strconv.ParseInt(splited[2], 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse buffsize: %s", splited[2])
+	}
+
+	return &sql.ThrottlerOpt{
+		MaxEles: int(maxEles),
+		Period: time.Duration(interval * int64(time.Second)),
+		BuffSize: int(buffSize),
+	}, nil
 }
 
 func init() {
@@ -78,9 +105,14 @@ func init() {
 		"filters", "F", []string{},
 		"filter to keep when eval to true(sql where syntax)",
 	)
-	var winOpts *[]string = flag.StringArrayP(
-		"winopt", "w", []string{},
+	var winOpts *string = flag.StringP(
+		"winopt", "w", "",
 		"window option for streaming, eg: SIZE:SLIDE:IDX_OF_TS where SIZE is the windows size, unit seconds, SLIDE can be zero means tumbling window, unit seconds, IDX_OF_TS is table col num of ts field. when use join query, you can't use IDX_OF_TS opt unless the schema of thoese table is the same",
+	)
+
+	var throttlers *[]string = flag.StringSliceP(
+		"throttlers", "t", []string{},
+		"throttlers for input speed throttle, eg: MAX_ELE:PERIOD_SEC:BUFF_SIZE where MAX_ELE is the max elements allowd, PERIOD_SEC is time period unit seconds and BUFF_SIZE is the buffer size for throttle",
 	)
 
 	// TODO: support different sink
@@ -89,9 +121,14 @@ func init() {
 		"sink", "s", "stdout", "sinkto dst, now support stdout",
 	)
 
+	var dbEngine *string = flag.StringP(
+		"db-engine", "d", "duckdb", "db engine for OLAP: sqlite/duckdb/qlbridge",
+	)
+
 	var formatter *string = flag.StringP(
 		"formatter", "o", "raw", "formatter for result show: raw(just print) rawv(like \\G) table(pretty print as table)",
 	)
+	
 	var logLevel *string = flag.StringP(
 		"log-level", "l", "info", "log level: info warn error fatal debug trace",
 	)
@@ -122,26 +159,32 @@ func init() {
 			return err
 		}
 
-		wins, err := parseWinOpt(*winOpts)
+		win, err := parseWinOpt(*winOpts)
 		if err != nil {
 			logger.Errorf("win opt parse failed: %s", err)
 			return err
 		}
 
-		logger.Debugf("win opts: %v", wins)
-		logger.Infof("Wait for logs to parse and analytics ...")
-		if len(args) == 1 {
-			// merge then query
-			squeryer.JoinRun(
-				*regexSlice, *filters, wins[0],
-				args[0], *sinkTo, *formatter,
-			)
-		} else {
-			squeryer.ParalleRun(
-				*regexSlice, *filters, wins,
-				args, *sinkTo, *formatter,
-			)
+		ths := make([]*sql.ThrottlerOpt, len(*throttlers))
+		for tidx, t := range *throttlers {
+			if t == "" {
+				ths[tidx] = nil
+			} else {
+				th, err := parseThrottleOpt(t)
+				if err != nil {
+					logger.Errorf("parse throttle opt failed: %s", err)
+					return err
+				}
+				ths[tidx] = th
+			}
 		}
+
+		logger.Debugf("win opts: %v", win)
+		logger.Infof("Wait for logs to parse and analytics ...")
+		squeryer.JoinRun(
+			*regexSlice, *filters, win,
+			args[0], *sinkTo, *formatter, *dbEngine, ths,
+		)
 		return nil
 	}
 	rootCmd.AddCommand(queryCmd)

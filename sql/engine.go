@@ -12,6 +12,7 @@ import (
 	"github.com/araddon/qlbridge/schema"
 	"github.com/sirupsen/logrus"
 	_ "modernc.org/sqlite"
+	_ "github.com/marcboeker/go-duckdb"
 )
 
 type SQLEngine interface {
@@ -39,8 +40,14 @@ type QLMemDBEngine struct {
 	DB *sql.DB
 }
 
+type DuckDBEngine struct {
+	LineParsers map[string]*LineParser
+	DB *sql.DB
+	logger *logrus.Logger
+}
+
 func NewSQLiteEngine(lparsers map[string]*LineParser, logger *logrus.Logger) (*SQLiteEngine, error) {
-	db, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	db, err := sql.Open("sqlite", "file::memory:")
 	if err != nil {
 		return nil, err
 	}
@@ -130,24 +137,10 @@ func (e *SQLiteEngine) Close() error {
 	return e.DB.Close()
 }
 
-func NewQLMembtreeDSEngine(ds *membtree.StaticDataSource, tname string, cols []string, logger *logrus.Logger) (*QLMemDBEngine, error) {
-	err := schema.RegisterSourceAsSchema(tname, ds)
-	if err != nil {
-		logger.Errorf("registe schema err: %s", err)
-		return nil, err
-	}
-
-	db, err := sql.Open("qlbridge", tname)
-	if err != nil {
-		logger.Errorf("open %s db failed: %s", tname, err)
-		return nil, err
-	}
-
+func NewQLMembtreeDSEngine(tname string, cols []string, logger *logrus.Logger) (*QLMemDBEngine, error) {
 	return &QLMemDBEngine{
-		DS: ds,
 		logger: logger,
 		dsn: tname,
-		DB: db,
 		cols: cols,
 	}, nil
 }
@@ -159,10 +152,25 @@ func (q *QLMemDBEngine) Query(sqlText string) (*sql.Rows, error) {
 
 func (q *QLMemDBEngine) Insert(tname string, rows []LRow) error {
 	q.DS = membtree.NewStaticDataSource(tname, len(q.cols)-1, rows, q.cols)
-	return schema.RegisterSourceAsSchema(tname, q.DS)
+	err := schema.RegisterSourceAsSchema(tname, q.DS)
+	if err != nil {
+		q.logger.Errorf("registe schema err: %s", err)
+		return err
+	}
+
+	db, err := sql.Open("qlbridge", tname)
+	if err != nil {
+		q.logger.Errorf("open %s db failed: %s", tname, err)
+		return err
+	}
+	q.DB = db
+	return nil
 }
 
 func (q *QLMemDBEngine) Clean() error {
+	if q.DB == nil {
+		return nil
+	}
 	err := q.DS.Close()
 	if err != nil {
 		return err
@@ -172,4 +180,98 @@ func (q *QLMemDBEngine) Clean() error {
 
 func (q *QLMemDBEngine) Close() error {
 	return q.DS.Close()
+}
+
+
+// DuckDB engine
+
+func NewDuckDBEngine(lparsers map[string]*LineParser, logger *logrus.Logger) (*DuckDBEngine, error) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		return nil, err
+	}
+
+	// first we create db/tables per line parser
+	for tname, lp := range lparsers {
+		logger.Debugf("create table %s: %s", tname, lp.Tschema)
+		r, err := db.ExecContext(
+			context.Background(),
+			lp.Tschema,
+		)
+		if err != nil {
+			logger.Errorf("create table schema %s err: %s", lp.Tschema, err)
+			return nil, err
+		}
+		logger.Debugf("create schema result: %s", r)
+	}
+
+	return &DuckDBEngine{
+		LineParsers: lparsers,
+		DB: db,
+		logger: logger,
+	}, nil
+}
+
+func (e *DuckDBEngine) Insert(tname string, rawRows []LRow) error {
+	e.logger.Debugf("sqlite: insert %s to %s", rawRows, tname)
+	// prepare some meta info
+	cols := e.LineParsers[tname].Cols
+	vsmt := []string{}
+	ecolsIdx := len(cols) - 2
+	for i := 0; i < len(cols) - 2; i++ {
+		vsmt = append(vsmt, "?")
+	}
+
+	insertSmt := fmt.Sprintf(
+		"INSERT INTO %s (%s) VALUES (%s);",
+		tname, strings.Join(cols[0:ecolsIdx], ", "),
+		strings.Join(vsmt, ", "),
+	)
+	smt, err := e.DB.Prepare(insertSmt)
+	if err != nil {
+		e.logger.Errorf("prepare smterr: %s", err)
+		return err
+	}
+	for _, r := range rawRows {
+		rany := make([]any, ecolsIdx)
+		for idx, v := range r[:ecolsIdx] {
+			rany[idx] = v
+		}
+		result, err := smt.Exec(
+			rany...,
+		)
+		if err != nil {
+			e.logger.Debugf("INSERT data err: %s", err)
+			return err
+		}
+		rowsEffected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		e.logger.Debugf("insert succ, rows effected: %d", rowsEffected)
+	}
+	return nil
+}
+
+func (e *DuckDBEngine) Query(sqlText string) (*sql.Rows, error) {
+	return e.DB.Query(sqlText)
+}
+
+func (e *DuckDBEngine) Clean() error {
+	e.logger.Debugf("run clean task on sqlite")
+	for tname := range e.LineParsers {
+		_, err := e.DB.ExecContext(
+			context.Background(),
+			fmt.Sprintf("DELETE FROM %s", tname),
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *DuckDBEngine) Close() error {
+	e.logger.Debugf("close sqllite")
+	return e.DB.Close()
 }
