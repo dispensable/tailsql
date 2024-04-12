@@ -1,11 +1,14 @@
 package source
 
 import (
+	"fmt"
 	"context"
 
 	"github.com/tenebris-tech/tail"
 	"github.com/reugn/go-streams"
 	"github.com/reugn/go-streams/flow"
+
+	"github.com/dispensable/tailsql/utils"
 )
 
 type FileSource struct {
@@ -16,12 +19,16 @@ type FileSource struct {
 }
 
 func NewFileSource(fileName string, cfg *tail.Config, ctx context.Context) (*FileSource, error) {
+	exists, err := utils.IsPathExists(fileName)
+	if err != nil || !exists {
+		return nil, fmt.Errorf("file %s not exists or check err: %s", fileName, err)
+	}
 	source := &FileSource{
 		fileName: fileName,
 		in: make(chan any),
 		cfg: cfg,
 	}
-	err := source.init(ctx)
+	err = source.init(ctx)
 	if err != nil {
 		return nil, err
 	}

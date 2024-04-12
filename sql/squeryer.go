@@ -25,68 +25,72 @@ import (
 	"github.com/araddon/qlbridge/expr/builtins"
 	"github.com/araddon/qlbridge/vm"
 
+	"github.com/dispensable/tailsql/config"
 	tailsink "github.com/dispensable/tailsql/sink"
 	tailsrc "github.com/dispensable/tailsql/source"
+	"github.com/dispensable/tailsql/utils"
 )
 
 var ALL_DONE = make(chan os.Signal, 1)
 
 func init() {
 	signal.Notify(ALL_DONE, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		fmt.Println(">>> Press CTRL + C to quit ...")
+		<- ALL_DONE
+		fmt.Println(">>> User ask to quit ...")
+		os.Exit(0)
+	}()
+	builtins.LoadAllBuiltins()
 }
 
 type LineParseFunc func(string) LRow
 
-type WindowOpt struct {
-	Size time.Duration
-	SlidingInterval time.Duration
-	TsExtractor func(LRow) int64
-}
-
-type ThrottlerOpt struct {
-	MaxEles int
-	Period time.Duration
-	BuffSize int
-}
-
-type LTable struct {
-	Name string
-	IdxCol int
-	Rows []LRow
-	Cols []string
-}
-
 type StreamQueryer struct {
 	logger *logrus.Logger
-	FileNames []string
+	Config *config.TailSqlCfg
 	filterExprs map[string]expr.Node
 	lineParsers []*LineParser
 	tableNames []string
 	engineLock *sync.Mutex
 }
 
-func NewStreamQueryer(filesToFollow []string, logger *logrus.Logger) (*StreamQueryer, error) {
-	if len(filesToFollow) == 0 {
-		filesToFollow = append(filesToFollow, "/dev/stdin")
+
+func NewStreamQueryerFromCfg(cfg *config.TailSqlCfg, logger *logrus.Logger) (*StreamQueryer, error) {
+	if len(cfg.FileCfgs) == 0 {
+		return nil, fmt.Errorf("cfg error, at least need 1 file to follow")
 	}
+
 	return &StreamQueryer{
 		logger: logger,
-		FileNames: filesToFollow,
+		Config: cfg,
 		engineLock: &sync.Mutex{},
 	}, nil
 }
 
-func (s *StreamQueryer) GenerateFilesSource(doNotTail bool) (context.CancelFunc, []*tailsrc.FileSource, error) {
-	r := []*tailsrc.FileSource{}
-	ctx, cfunc := context.WithCancel(context.Background())
-	for _, f := range s.FileNames {
-		isP, err := IsNamedPipe(f)
+func (s *StreamQueryer) GenerateFSSource(ctx context.Context, fc *config.FollowFileCfg) (streams.Source, error) {
+	f := fc.Path
+	// nameedpipe file
+	isP, err := utils.IsNamedPipe(f)
+	if err != nil {
+		return nil, err
+	}
+	s.logger.Debugf("%s is named pipe: %t", f, isP)
+	if isP {
+		npipeSrc, err := tailsrc.NewNamedPipeSrc(f, ctx)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		s.logger.Debugf("%s is named pipe: %t", f, isP)
+		return npipeSrc, nil
+	} else if f == "/dev/stdin" {
+		stdinSrc, err := tailsrc.NewStdinSrc(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return stdinSrc, nil
+	} else {
 		whence := os.SEEK_END
-		if doNotTail {
+		if fc.DoNotTail {
 			whence = os.SEEK_CUR
 		}
 		tailCfg := &tail.Config{
@@ -94,16 +98,13 @@ func (s *StreamQueryer) GenerateFilesSource(doNotTail bool) (context.CancelFunc,
 			ReOpen: true,
 			MustExist: true,
 			Follow: true,
-			Pipe: isP,
 		}
 		s, err := tailsrc.NewFileSource(f, tailCfg, ctx)
 		if err != nil {
-			defer cfunc()
-			return nil, nil, err
+			return nil, err
 		}
-		r = append(r, s)
+		return s, nil
 	}
-	return cfunc, r, nil
 }
 
 func (s *StreamQueryer) getLineMapFunc(re string, tname string) (flow.MapFunction[string, LRow], error) {
@@ -165,15 +166,35 @@ func (s *StreamQueryer) getFilterFunc(filter string, cols []string) (flow.Filter
 	return f, nil
 }
 
-func (s *StreamQueryer) getWinByOpt(opt *WindowOpt) streams.Flow {
-	if opt.SlidingInterval != 0 {
-		if opt.TsExtractor == nil {
-			return flow.NewSlidingWindow[LRow](opt.Size, opt.SlidingInterval)
+func (s *StreamQueryer) getWinByOpt(opt *config.WindowCfg) streams.Flow {
+	var tsExtracF func(LRow) int64
+	
+	if opt.IdxOfTsField >= 0 {
+		tsExtracF = func(row LRow) int64 {
+			f := row[opt.IdxOfTsField]
+			if v, ok := f.(time.Time); ok {
+				return int64(v.Nanosecond())
+			} else {
+				panic(fmt.Sprintf("idx %d of row is not a date type", opt.IdxOfTsField))
+			}
+		}
+	}
+
+	if opt.SlidingIntervalSeconds != 0 {
+		if tsExtracF == nil {
+			return flow.NewSlidingWindow[LRow](
+				time.Duration(opt.SizeSeconds * int(time.Second)),
+				time.Duration(opt.SlidingIntervalSeconds * int(time.Second)),
+			)
 		} else {
-			return flow.NewSlidingWindowWithExtractor[LRow](opt.Size, opt.SlidingInterval, opt.TsExtractor)
+			return flow.NewSlidingWindowWithExtractor[LRow](
+				time.Duration(opt.SizeSeconds * int(time.Second)),
+				time.Duration(opt.SlidingIntervalSeconds * int(time.Second)),
+				tsExtracF,
+			)
 		}
 	} else {
-		return flow.NewTumblingWindow[LRow](opt.Size)
+		return flow.NewTumblingWindow[LRow](time.Duration(opt.SizeSeconds * int(time.Second)))
 	}
 }
 
@@ -273,13 +294,6 @@ func (s *StreamQueryer) getRunSqlOnMultiTableMapF(
 	return f
 }
 
-func (s *StreamQueryer) waitForQuit() {
-	s.logger.Infof("Streaming sql analytics started, use CTRL+C to quit ...")
-	<- ALL_DONE
-	s.logger.Infof("User ask quit ...")
-	os.Exit(0)
-}
-
 func (s *StreamQueryer) getFormatter(format string) (tailsink.RowsFormatter, error) {
 	switch format {
 	case "raw":
@@ -326,100 +340,73 @@ func (s *StreamQueryer) PrintRows(rows *sql.Rows, closeAfterPrint bool) error {
 	return nil
 }
 
-func (s *StreamQueryer) getFilterFuncs(filters []string) ([]flow.FilterPredicate[LRow], error) {
-	// prepare filter functions
-	builtins.LoadAllBuiltins()
-	filterFuncs := make([]flow.FilterPredicate[LRow], len(filters))
-	for fidx, filter := range filters {
-		if filter == "" {
-			// use don't wanna use filter on this stream ignore
-			filterFuncs[fidx] = nil
-			continue
-		}
-
-		rf, err := s.getFilterFunc(filter, s.lineParsers[fidx].Cols)
-		if err != nil {
-			return nil, fmt.Errorf("init filter func error: %s", err)
-		}
-		filterFuncs[fidx] = rf
-	}
-	return filterFuncs, nil
-}
-
-func (s *StreamQueryer) getThrottlers(tconfigs []*ThrottlerOpt) ([]*flow.Throttler, error) {
-	if len(tconfigs) == 0 {
+func (s *StreamQueryer) getThrottler(tc *config.ThrottlerCfg) (*flow.Throttler, error) {
+	// maxeles zero means we don't wanna a throttler
+	if tc == nil || tc.MaxEles == 0 {
 		return nil, nil
 	}
-
-	r := make([]*flow.Throttler, len(tconfigs))
-	for idx, tc := range tconfigs {
-		// maxeles zero means we don't wanna a throttler
-		if tc == nil || tc.MaxEles == 0 {
-			r[idx] = nil
-			continue
-		}
-		r[idx] = flow.NewThrottler(tc.MaxEles, tc.Period, tc.BuffSize, flow.Discard)
-	}
-	return r, nil
+	return flow.NewThrottler(
+		tc.MaxEles, time.Duration(tc.PeriodSeconds * int(time.Second)),
+		tc.BufferSize, flow.Discard,
+	), nil
 }
 
-func (s *StreamQueryer) JoinRun(rowRes, filters []string,
-	winOpt *WindowOpt,
-	sqlText, sinkTo, formatter, dbengine string,
-	doNotTail bool,
-	throttleOpts []*ThrottlerOpt) error {
-	// prepare parse functions
-	lparseFuncs := []flow.MapFunction[string, LRow]{}
-	for ridx, re := range rowRes {
-		s.tableNames = append(s.tableNames, fmt.Sprintf("t%d", ridx))
-		pf, err := s.getLineMapFunc(re, s.tableNames[ridx])
+func (s *StreamQueryer) RunAnalysisFromCfg(sqlText string) error {
+	cfg := s.Config
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mFlows []streams.Flow
+
+	for idx, fileCfg := range cfg.FileCfgs {
+		// prepare parse functions
+		s.tableNames = append(s.tableNames, fmt.Sprintf("t%d", idx))
+		pf, err := s.getLineMapFunc(fileCfg.Regex, s.tableNames[idx])
 		if err != nil {
 			return err
 		}
-		lparseFuncs = append(lparseFuncs, pf)
-	}
 
-	// prepare filter functions
-	filterFuncs, err := s.getFilterFuncs(filters)
-	if err != nil {
-		return err
-	}
-
-	// prepare throttler
-	throttlers, err := s.getThrottlers(throttleOpts)
-	if err != nil {
-		return err
-	}
-
-	// prepare fs source
-	cancelTailF, sources, err := s.GenerateFilesSource(doNotTail)
-	if err != nil {
-		return err
-	}
-	defer cancelTailF()
-
-	// log -> parse -> filter -> throttler -> sql row -> window -> ds -> run sql -> sink
-	// log -> parse -> filter -> throttler -> sql row /
-	// ...
-	var mFlows []streams.Flow
-	for sidx, src := range sources {
-		f := src.Via(
-			flow.NewMap[string, LRow](lparseFuncs[sidx], 10),
-		)
-
-		// if user not defined filter we just ignore
-		if len(filterFuncs) > 0 && filterFuncs[sidx] != nil {
-			f.Via(flow.NewFilter[LRow](filterFuncs[sidx], 10))	
+		// prepare filter functions
+		var filterFunc flow.FilterPredicate[LRow]
+		if fileCfg.Filter != "" {
+			s.logger.Debugf("parse and create filters ...")
+			filterFunc, err = s.getFilterFunc(fileCfg.Filter, s.lineParsers[idx].Cols)
+			if err != nil {
+				return err
+			}
 		}
 
-
-		// if user not defined throttler we just ignore
-		if len(throttlers) > 0 && throttlers[sidx] != nil {
-			f.Via(throttlers[sidx])
+		// prepare throttler
+		var throttler *flow.Throttler
+		if fileCfg.ThrottleOpt != nil {
+			s.logger.Debugf("parse and create throttlers ...")
+			throttler, err = s.getThrottler(fileCfg.ThrottleOpt)
+			if err != nil {
+				return err
+			}
 		}
 
-		mFlows = append(mFlows, f)
+		// prepare fs source
+		s.logger.Debugf("genearte fs source ...")
+		src, err := s.GenerateFSSource(ctx, fileCfg)
+		if err != nil {
+			return err
+		}
+
+		// log -> parse -> filter -> throttler -> sql row -> window -> ds -> run sql -> sink
+		// log -> parse -> filter -> throttler -> sql row /
+		// ...
+		nextFlow := src.Via(flow.NewMap[string, LRow](pf, 10))
+		if filterFunc != nil {
+			nextFlow = nextFlow.Via(flow.NewFilter[LRow](filterFunc, 10))
+		}
+		if throttler != nil {
+			nextFlow = nextFlow.Via(throttler)
+		}
+		mFlows = append(mFlows, nextFlow)
 	}
+
+
 	mFlow := flow.Merge(mFlows...)
 
 	tableMetaData := map[string][]string{}
@@ -427,19 +414,18 @@ func (s *StreamQueryer) JoinRun(rowRes, filters []string,
 		tableMetaData[lp.Tname] = lp.Cols
 	}
 
-	go s.waitForQuit()
-
-	insertRowsToSqlNg, err := s.getLRowsToTableByTnameFunc(tableMetaData, dbengine)
+	insertRowsToSqlNg, err := s.getLRowsToTableByTnameFunc(tableMetaData, cfg.DBEngine)
 	if err != nil {
 		return err
 	}
 
-	pprinter, err := s.getFormatter(formatter)
+	pprinter, err := s.getFormatter(cfg.Sink.Formatter)
 	if err != nil {
 		return err
 	}
 
-	mFlow.Via(s.getWinByOpt(winOpt)).Via(
+	s.logger.Infof("Query stream started, please wait %ds...", cfg.WinOpt.SizeSeconds)
+	mFlow.Via(s.getWinByOpt(cfg.WinOpt)).Via(
 		// create multi table by metafiled __tname
 		// so we can support sql join
 		// we must ensure all table created

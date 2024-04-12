@@ -1,0 +1,47 @@
+# you can follow multi files
+# each file will be parsed to one table
+# tablename is `t<index_of_files_cfg>` like t0, t1, t2
+# you can use join to do your analytics job
+files:
+  - path: "/dev/stdin"   # path of files to follow, support file/namedpipe/stdin
+    # regex with caputre group as table row define (?P<fieldname__filedtype>regex)
+    # filedname is the table row name
+    # __ is separator
+    # filedtype is type of filed support float/int/date/str
+    regex: ""
+    # filter to select row to table
+    # syntax is like sql where clause
+    # randfilter(x) can be used to sample rows, 0<x<1 means sample rate
+    filter: ""
+    # throttler to throttle input speed
+    # if overflow the input will be discard
+    # if u set max_elements_in_period to zero, means no throttle
+    throttle:
+      max_elements_in_period: 0
+      period_seconds: 0
+      buffer_size: 0
+    # default the cli will seek to file end(like tail -f)
+    # if you set this to true, will process from the start of file
+    do_not_tail: false
+log:
+  # info/debug/error/trace
+  level: "info"
+window:
+  # window cfg of stream job
+  # if you set sliding_interval_seconds to zero, means this is a tumbling window
+  size_seconds: 10
+  sliding_interval_seconds: 5
+  idx_of_ts_field: -1
+sink:
+  to: "stdout"
+  # support table/raw/rawv
+  # table: like mysqlcli table print
+  # rawv: like \G
+  # raw: comma seperated line
+  formatter: "table"
+# support duckdb/sqlite/qlbridge
+# sqlengine in memory for OLAP job
+# duckdb: https://duckdb.org/
+# sqlite: https://www.sqlite.org/
+# qlbridge: https://github.com/araddon/qlbridge/tree/master/datasource/membtree
+db_engine: "duckdb"
