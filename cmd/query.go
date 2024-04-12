@@ -121,6 +121,10 @@ func init() {
 		"sink", "s", "stdout", "sinkto dst, now support stdout",
 	)
 
+	var doNotTail *bool = flag.BoolP(
+		"do-not-tail", "T", false, "process from file start not tail -f",
+	)
+
 	var dbEngine *string = flag.StringP(
 		"db-engine", "d", "duckdb", "db engine for OLAP: sqlite/duckdb/qlbridge",
 	)
@@ -183,7 +187,8 @@ func init() {
 		logger.Infof("Wait for logs to parse and analytics ...")
 		squeryer.JoinRun(
 			*regexSlice, *filters, win,
-			args[0], *sinkTo, *formatter, *dbEngine, ths,
+			args[0], *sinkTo, *formatter, *dbEngine,
+			*doNotTail, ths,
 		)
 		return nil
 	}

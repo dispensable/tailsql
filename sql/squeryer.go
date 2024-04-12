@@ -76,16 +76,26 @@ func NewStreamQueryer(filesToFollow []string, logger *logrus.Logger) (*StreamQue
 	}, nil
 }
 
-func (s *StreamQueryer) GenerateFilesSource() (context.CancelFunc, []*tailsrc.FileSource, error) {
+func (s *StreamQueryer) GenerateFilesSource(doNotTail bool) (context.CancelFunc, []*tailsrc.FileSource, error) {
 	r := []*tailsrc.FileSource{}
-	tailCfg := &tail.Config{
-		Location: &tail.SeekInfo{Offset: 0, Whence: os.SEEK_END},
-		ReOpen: true,
-		MustExist: true,
-		Follow: true,
-	}
 	ctx, cfunc := context.WithCancel(context.Background())
 	for _, f := range s.FileNames {
+		isP, err := IsNamedPipe(f)
+		if err != nil {
+			return nil, nil, err
+		}
+		s.logger.Debugf("%s is named pipe: %t", f, isP)
+		whence := os.SEEK_END
+		if doNotTail {
+			whence = os.SEEK_CUR
+		}
+		tailCfg := &tail.Config{
+			Location: &tail.SeekInfo{Offset: 0, Whence: whence},
+			ReOpen: true,
+			MustExist: true,
+			Follow: true,
+			Pipe: isP,
+		}
 		s, err := tailsrc.NewFileSource(f, tailCfg, ctx)
 		if err != nil {
 			defer cfunc()
@@ -105,7 +115,11 @@ func (s *StreamQueryer) getLineMapFunc(re string, tname string) (flow.MapFunctio
 	return func(line string) LRow {
 		lr, err := p.parse(line)
 		if err != nil {
-			s.logger.Warnf("parse line %s err: %s", line, err)
+			s.logger.Debugf("parse line %s err: %s", line, err)
+			return nil
+		}
+		if len(lr) != len(p.Cols) {
+			s.logger.Errorf("line row fields not match: %v", lr)
 			return nil
 		}
 		return lr
@@ -127,6 +141,9 @@ func (s *StreamQueryer) getFilterFunc(filter string, cols []string) (flow.Filter
 	}
 
 	f := func(l LRow) bool {
+		if l == nil || len(l) == 0 {
+			return false
+		}
 		evalCtx := datasource.NewSqlDriverMessageMapVals(0, l, cols)
 		ast := s.filterExprs[filter]
 		s.logger.Debugf("expr: %v", ast)
@@ -205,6 +222,9 @@ func (s *StreamQueryer) getLRowsToTableByTnameFunc(
 			var v string
 			var ok bool
 			s.logger.Debugf("++ raw rows: %v", r)
+			if len(r) == 0 {
+				continue
+			}
 			if v, ok = r[len(r)-2].(string); !ok {
 				s.logger.Errorf("parse tname failed: %v", r)
 				continue
@@ -344,7 +364,9 @@ func (s *StreamQueryer) getThrottlers(tconfigs []*ThrottlerOpt) ([]*flow.Throttl
 }
 
 func (s *StreamQueryer) JoinRun(rowRes, filters []string,
-	winOpt *WindowOpt, sqlText, sinkTo, formatter, dbengine string,
+	winOpt *WindowOpt,
+	sqlText, sinkTo, formatter, dbengine string,
+	doNotTail bool,
 	throttleOpts []*ThrottlerOpt) error {
 	// prepare parse functions
 	lparseFuncs := []flow.MapFunction[string, LRow]{}
@@ -370,7 +392,7 @@ func (s *StreamQueryer) JoinRun(rowRes, filters []string,
 	}
 
 	// prepare fs source
-	cancelTailF, sources, err := s.GenerateFilesSource()
+	cancelTailF, sources, err := s.GenerateFilesSource(doNotTail)
 	if err != nil {
 		return err
 	}

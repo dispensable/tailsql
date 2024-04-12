@@ -38,6 +38,9 @@ func (s *FileSource) init(ctx context.Context) error {
 		for {
 			select {
 			case line := <- t.Lines:
+				if line == nil {
+					continue
+				}
 				s.in <- line.Text
 			case <- ctx.Done():
 				t.Cleanup()
@@ -57,4 +60,5 @@ func (fs *FileSource) Via(operator streams.Flow) streams.Flow {
 // Out returns the output channel of the FileSource connector.
 func (fs *FileSource) Out() <-chan any {
 	return fs.in
+
 }
