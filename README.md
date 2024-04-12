@@ -1,14 +1,16 @@
 # tailsql
 
-tailsql can continuely run sql query on tumbling/sliding window of log files.
+tailsql can continually run sql query on tumbling/sliding window of log files records.
 
 # why
 
 - when reading logs using `tail -f`, sometimes it flushs too fast to read
 - sometime you just wanna do some simple aggregation/join analytics, and awk can't express this with one line
-- you wanna aggregation data like stream, but traditional unix tools just works like batch job
+- you wanna aggregate data like stream job, but traditional unix tools works like batch job
+- you wanna compare two or more log files on sepecific fields but other records rushed into the small screen
 
 # usage
+
 It's a go-stream pipeline job like:
 
 ```
@@ -19,9 +21,9 @@ log -> parse -> filter -> throttler -> sql row /
 
 for example log format like this: `2024/04/12 22:47:42.506277 GETM SUCC localhost:7710 605` (ts method result server time_used)
 
-you can run query to anylytic your log
+you can run query to analytic your log
 
-```
+```bash
 tailsql query \
     -f my.log \
     # use capture group to parse log to table row
